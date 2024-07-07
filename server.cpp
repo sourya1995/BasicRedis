@@ -1,14 +1,16 @@
+#include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
-#include <assert.h>
-#include <cassert>
+#include <vector>
 
 static void msg(const char *msg)
 {
@@ -17,51 +19,60 @@ static void msg(const char *msg)
 
 static void die(const char *msg)
 {
-    int error = errno;
-    fprintf(stderr, "[%d] %s\n", error, msg);
+    int err = errno;
+    fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
 }
 
-static void do_something(int connfd)
+static void fd_set_nb(int fd)
 {
-    char rbuf[64] = {};
-    ssize_t n = read(connfd, rbuf, sizeof(rbuf) - 1);
-    if (n < 0)
+    errno = 0;
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (errno)
     {
-        msg("read() error");
+        die("fcntl error");
         return;
     }
-    printf("client says: %s\n", rbuf);
 
-    char wbuf[] = "world";
-    write(connfd, wbuf, strlen(wbuf));
+    flags |= O_NONBLOCK;
+
+    errno = 0;
+    (void)fcntl(fd, F_SETFL, flags);
+    if (errno)
+    {
+        die("fcntl error");
+    }
 }
 
-static int32_t read_full(int fd, char *buf, size_t n) //read from file descriptor into a buffer
+enum {
+    STATE_REQ = 0,
+    STATE_RES = 1,
+    STATE_END = 2, //mark the connection for deletion
+};
+
+struct Conn {
+    int fd = -1;
+    u_int32_t state = 0;
+
+    // buffer for reading
+    size_t rbuf_size = 0;
+    uint8_t rbuf[4 + k_max_msg];
+    // buffer for writing
+    size_t wbuf_size = 0;
+    size_t wbuf_sent = 0;
+    uint8_t wbuf[4 + k_max_msg];
+};
+
+const size_t k_max_msg = 4096;
+
+static int32_t read_full(int fd, char *buf, size_t n)
 {
     while (n > 0)
     {
         ssize_t rv = read(fd, buf, n);
         if (rv <= 0)
         {
-            return -1;
-            // error, or unexpected EOF
-        }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv;
-    }
-    return 0;
-}
-static int32_t write_all(int fd, const char *buf, size_t n) //write n bytes from a buffer to a file descriptor
-{
-    while (n > 0)
-    {
-        ssize_t rv = write(fd, buf, n);
-        if (rv <= 0)
-        {
-            return -1;
-            // error
+            return -1; // error, or unexpected EOF
         }
         assert((size_t)rv <= n);
         n -= (size_t)rv;
@@ -70,7 +81,21 @@ static int32_t write_all(int fd, const char *buf, size_t n) //write n bytes from
     return 0;
 }
 
-const size_t k_max_msg = 4096;
+static int32_t write_all(int fd, const char *buf, size_t n)
+{
+    while (n > 0)
+    {
+        ssize_t rv = write(fd, buf, n);
+        if (rv <= 0)
+        {
+            return -1; // error
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
+        buf += rv;
+    }
+    return 0;
+}
 
 static int32_t one_request(int connfd)
 {
@@ -128,15 +153,16 @@ int main()
         die("socket()");
     }
 
+    // this is needed for most server applications
     int val = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
-    // bind to address
+    // bind
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = ntohs(1234);
-    addr.sin_addr.s_addr = ntohl(0);
-    int rv = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
+    addr.sin_addr.s_addr = ntohl(0); // wildcard address 0.0.0.0
+    int rv = bind(fd, (const sockaddr *)&addr, sizeof(addr));
     if (rv)
     {
         die("bind()");
@@ -155,23 +181,20 @@ int main()
         struct sockaddr_in client_addr = {};
         socklen_t socklen = sizeof(client_addr);
         int connfd = accept(fd, (struct sockaddr *)&client_addr, &socklen);
-
         if (connfd < 0)
         {
-            continue;
+            continue; // error
         }
 
-        // only serve one client at a time
         while (true)
         {
+            // here the server only serves one client connection at once
             int32_t err = one_request(connfd);
             if (err)
             {
                 break;
             }
         }
-
-        do_something(connfd);
         close(connfd);
     }
 
